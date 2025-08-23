@@ -1,9 +1,11 @@
 // app/(tabs)/index.tsx
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { View, Text, StyleSheet, ScrollView, Pressable, StatusBar, SafeAreaView, Modal } from "react-native";
 import { Ionicons, MaterialIcons } from "@expo/vector-icons";
 import { useRouter, Stack } from "expo-router";
 import { Image } from "expo-image";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { useFocusEffect } from "@react-navigation/native";
 
 // Subjects for certificate prep
 const SUBJECTS = [
@@ -40,21 +42,73 @@ const PATHS = {
   ],
 };
 
+// Add this helper to determine lesson order for progression
+const LESSON_ORDER = {
+  math: ["1", "algebra", "geometry", "calculus", "statistics"],
+  english: ["1", "grammar", "comprehension", "writing", "vocabulary"],
+  science: ["1", "physics", "chemistry", "biology", "earthscience"],
+};
+
 type NodeStatus = "start" | "available" | "locked" | "chest";
+
+// Utility to persist completed lessons per subject (mobile-friendly)
+async function getCompletedLessons() {
+  try {
+    const raw = await AsyncStorage.getItem("completedLessons");
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return { math: ["1"], english: ["1"], science: ["1"] };
+}
+async function setCompletedLessonsStorage(data) {
+  try {
+    await AsyncStorage.setItem("completedLessons", JSON.stringify(data));
+  } catch {}
+}
 
 // Main Home Screen
 export default function CertificatePrepHome() {
   const [subject, setSubject] = useState("math");
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedLesson, setSelectedLesson] = useState<any>(null);
+  const [showCompletedAnim, setShowCompletedAnim] = useState(false);
+  const [completedLessons, setCompletedLessons] = useState({ math: ["1"], english: ["1"], science: ["1"] });
   const router = useRouter();
   const pathData = PATHS[subject];
+
+  // Load completed lessons from AsyncStorage on mount and when focused
+  useFocusEffect(
+    React.useCallback(() => {
+      getCompletedLessons().then(setCompletedLessons);
+    }, [subject])
+  );
+
+  // Helper: is lesson unlocked?
+  const isLessonUnlocked = (lessonName: string) => {
+    const order = LESSON_ORDER[subject];
+    const idx = order.indexOf(lessonName);
+    if (idx === -1) return false;
+    if (idx === 0) return true;
+    return completedLessons[subject].includes(order[idx - 1]);
+  };
+
+  // Helper: is lesson completed?
+  const isLessonCompleted = (lessonName: string) => {
+    return completedLessons[subject].includes(lessonName);
+  };
 
   // Handle lesson node click
   const handleLessonPress = (node: any) => {
     if (node.href) {
-      setSelectedLesson(node);
-      setModalVisible(true);
+      const hrefParts = node.href.split("/");
+      const lessonName = hrefParts[hrefParts.length - 1];
+      if (isLessonUnlocked(lessonName) && !isLessonCompleted(lessonName)) {
+        setSelectedLesson(node);
+        setModalVisible(true);
+      }
+      if (isLessonCompleted(lessonName)) {
+        setShowCompletedAnim(true);
+        setTimeout(() => setShowCompletedAnim(false), 1200);
+      }
     }
   };
 
@@ -62,12 +116,49 @@ export default function CertificatePrepHome() {
   const startLesson = () => {
     setModalVisible(false);
     if (selectedLesson) {
+      const hrefParts = selectedLesson.href.split("/");
+      const lessonName = hrefParts[hrefParts.length - 1];
       router.push({
         pathname: "/lesson",
-        params: { subject },
+        params: { subject, lesson: lessonName },
       });
     }
   };
+
+  // Listen for lesson completion (from URL params)
+  useEffect(() => {
+    const checkCompletion = async () => {
+      const params = typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search)
+        : router?.params || {};
+      const subj = params.get ? params.get("subject") : params.subject;
+      const les = params.get ? params.get("lesson") : params.lesson;
+      const completed = params.get ? params.get("completed") : params.completed;
+      if (completed === "true" && subj && les) {
+        setCompletedLessons(prev => {
+          const updated = {
+            ...prev,
+            [subj]: prev[subj].includes(les) ? prev[subj] : [...prev[subj], les],
+          };
+          setCompletedLessonsStorage(updated);
+          return updated;
+        });
+        if (typeof window !== "undefined") {
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+      }
+    };
+    checkCompletion();
+  }, [router]);
+
+  // Find next lesson to do
+  const nextLessonIdx = LESSON_ORDER[subject].findIndex(
+    (lessonName, idx, arr) =>
+      !completedLessons[subject].includes(lessonName) &&
+      (idx === 0 || completedLessons[subject].includes(arr[idx - 1]))
+  );
+  const nextLessonName =
+    nextLessonIdx !== -1 ? LESSON_ORDER[subject][nextLessonIdx] : null;
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -131,12 +222,41 @@ export default function CertificatePrepHome() {
         {/* Path */}
         <View style={styles.pathWrap}>
           <View style={styles.pathCol}>
-            {pathData.map((n, idx) => (
-              <React.Fragment key={n.id}>
-                {idx > 0 && <View style={styles.connector} />}
-                <PathNode {...n} onPress={() => handleLessonPress(n)} />
-              </React.Fragment>
-            ))}
+            {pathData.map((n, idx) => {
+              // Extract lesson name from href
+              let lessonName = "";
+              if (n.href) {
+                const hrefParts = n.href.split("/");
+                lessonName = hrefParts[hrefParts.length - 1];
+              }
+              const unlocked = lessonName ? isLessonUnlocked(lessonName) : false;
+              const completed = lessonName ? isLessonCompleted(lessonName) : false;
+              const isNext = lessonName === nextLessonName;
+              return (
+                <React.Fragment key={n.id}>
+                  {idx > 0 && <View style={styles.connector} />}
+                  <PathNode
+                    {...n}
+                    unlocked={unlocked}
+                    completed={completed}
+                    isNext={isNext}
+                    onPress={() => handleLessonPress(n)}
+                  />
+                  {/* Animation for completed lesson */}
+                  {completed && (
+                    <View style={styles.completedAnim}>
+                      <Ionicons name="checkmark-circle" size={32} color="#22c55e" />
+                    </View>
+                  )}
+                  {isNext && !completed && (
+                    <View style={styles.nextAnim}>
+                      <Ionicons name="arrow-down-circle" size={32} color="#2563eb" />
+                      <Text style={styles.nextLabel}>Next up!</Text>
+                    </View>
+                  )}
+                </React.Fragment>
+              );
+            })}
           </View>
           <Image
             source={require("@/assets/images/mascot.png")}
@@ -144,6 +264,13 @@ export default function CertificatePrepHome() {
             contentFit="contain"
           />
         </View>
+
+        {/* Completed animation */}
+        {showCompletedAnim && (
+          <View style={styles.completedPopup}>
+            <Text style={styles.completedPopupText}>🎉 Lesson already completed!</Text>
+          </View>
+        )}
 
         {/* Certificate Card */}
         <View style={styles.certificateCard}>
@@ -216,11 +343,17 @@ function PathNode({
   status,
   href,
   title,
+  unlocked,
+  completed,
+  isNext,
   onPress,
 }: {
   status: NodeStatus;
   href?: string;
   title?: string;
+  unlocked?: boolean;
+  completed?: boolean;
+  isNext?: boolean;
   onPress?: () => void;
 }) {
   const core = (
@@ -231,12 +364,24 @@ function PathNode({
         status === "available" && styles.nodeAvailable,
         status === "locked" && styles.nodeLocked,
         status === "chest" && styles.nodeChest,
+        unlocked === false && styles.nodeLocked,
+        completed && styles.nodeCompleted,
+        isNext && !completed && styles.nodeNext,
       ]}
     >
-      {status === "start" && <Ionicons name="star" size={32} color="#fff" />}
-      {status === "available" && <Ionicons name="star" size={32} color="#4cc9f0" />}
-      {status === "locked" && <Ionicons name="lock-closed" size={30} color="#fff" />}
-      {status === "chest" && <MaterialIcons name="verified" size={32} color="#e04ca3" />}
+      {completed ? (
+        <Ionicons name="checkmark-circle" size={32} color="#22c55e" />
+      ) : isNext && !completed ? (
+        <Ionicons name="arrow-down-circle" size={32} color="#2563eb" />
+      ) : status === "start" ? (
+        <Ionicons name="star" size={32} color="#fff" />
+      ) : status === "available" ? (
+        <Ionicons name="star" size={32} color="#4cc9f0" />
+      ) : status === "locked" || unlocked === false ? (
+        <Ionicons name="lock-closed" size={30} color="#fff" />
+      ) : status === "chest" ? (
+        <MaterialIcons name="verified" size={32} color="#e04ca3" />
+      ) : null}
     </View>
   );
 
@@ -244,10 +389,18 @@ function PathNode({
     <View style={{ alignItems: "center" }}>
       {title ? (
         <View style={styles.nodeLabelBox}>
-          <Text style={styles.nodeLabel}>{title}</Text>
+          <Text
+            style={[
+              styles.nodeLabel,
+              completed && styles.nodeLabelCompleted,
+              isNext && !completed && styles.nodeLabelNext,
+            ]}
+          >
+            {title}
+          </Text>
         </View>
       ) : null}
-      {href ? (
+      {href && unlocked ? (
         <Pressable onPress={onPress} style={({ pressed }) => pressed && { transform: [{ scale: 0.98 }] }}>
           {core}
         </Pressable>
@@ -437,7 +590,7 @@ const styles = StyleSheet.create({
     elevation: 6,
   },
   nodeStart: {
-    borderColor: "#2563eb",
+    borderColor: "#e04ca3",
     backgroundColor: "#1e293b",
   },
   nodeAvailable: {
@@ -450,6 +603,40 @@ const styles = StyleSheet.create({
   nodeChest: {
     borderColor: "#e04ca3",
     backgroundColor: "#23232a",
+  },
+  nodeCompleted: {
+    borderColor: "#22c55e",
+    backgroundColor: "#1e293b",
+  },
+  nodeLabelCompleted: {
+    color: "#22c55e",
+  },
+  completedAnim: {
+    alignItems: "center",
+    marginTop: -32,
+    marginBottom: 8,
+  },
+  nodeNext: {
+    borderColor: "#2563eb",
+    backgroundColor: "#23232a",
+    shadowColor: "#2563eb",
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  nodeLabelNext: {
+    color: "#2563eb",
+    fontWeight: "bold",
+  },
+  nextAnim: {
+    alignItems: "center",
+    marginTop: -24,
+    marginBottom: 8,
+  },
+  nextLabel: {
+    color: "#2563eb",
+    fontWeight: "bold",
+    fontSize: 14,
   },
   nodeLabelBox: {
     backgroundColor: "#23232a",
@@ -617,31 +804,55 @@ const styles = StyleSheet.create({
     color: "#bbb",
     fontSize: 13,
     fontWeight: "700",
-    marginTop: 2,
+    marginTop: 4,
+  },
+  navIcon: {
+    color: "#fff",
+    fontSize: 22,
   },
   navBadge: {
     position: "absolute",
-    top: 2,
-    right: 14,
-    width: 10,
-    height: 10,
-    borderRadius: 5,
+    right: 0,
+    top: 0,
+    width: 8,
+    height: 8,
+    borderRadius: 4,
     backgroundColor: "#e04ca3",
-    borderWidth: 2,
-    borderColor: "#23232a",
   },
   profileCircle: {
     width: 28,
     height: 28,
     borderRadius: 14,
-    backgroundColor: "#e04ca3",
-    alignItems: "center",
+    backgroundColor: "#4f46e5",
     justifyContent: "center",
-    marginTop: 2,
+    alignItems: "center",
+    overflow: "hidden",
   },
   profileInitial: {
     color: "#fff",
     fontWeight: "700",
-    fontSize: 15,
+    fontSize: 14,
+  },
+  completedPopup: {
+    position: "absolute",
+    top: 120,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    zIndex: 10,
+  },
+  completedPopupText: {
+    backgroundColor: "#23232a",
+    color: "#22c55e",
+    fontWeight: "bold",
+    fontSize: 18,
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: "#22c55e",
+    shadowColor: "#000",
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 8,
   },
 });
